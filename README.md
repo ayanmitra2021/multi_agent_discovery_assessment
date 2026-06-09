@@ -376,7 +376,7 @@ Recommend a target architecture and give me a rough effort estimate.
 |---|---|
 | Web UI | React + TypeScript + Tailwind CSS |
 | Backend API | FastAPI (Python) |
-| Agent Framework | LangGraph / custom orchestration |
+| Agent Framework | Claude Agentic SDK (`anthropic`) + custom `PipelineOrchestrator` |
 | LLM Providers | Anthropic Claude, OpenAI GPT-4o, Google Gemini |
 | Document Parsing | `python-docx`, `pdfplumber`, `openpyxl` |
 | Report Generation | `python-docx`, `reportlab`, Jinja2 templates |
