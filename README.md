@@ -11,6 +11,7 @@
 - [Agent Architecture](#agent-architecture)
   - [Orchestrator Agent](#orchestrator-agent)
   - [Discovery Agent](#discovery-agent)
+  - [Org Policies Agent](#org-policies-agent)
   - [Architecture Agent](#architecture-agent)
   - [Estimation Agent](#estimation-agent)
 - [Input Formats](#input-formats)
@@ -66,21 +67,32 @@ User Upload + Prompt
 │   (Intent → Plan)   │
 └──────────┬──────────┘
            │
-     ┌─────┼─────┐
-     ▼     ▼     ▼
-┌────────┐ ┌────────┐ ┌────────────┐
-│Discovery│ │Architect│ │ Estimation │
-│ Agent   │ │ Agent   │ │   Agent    │
-└────────┘ └────────┘ └────────────┘
-     │           │           │
-     └─────┬─────┘           │
-           ▼                 ▼
-     ┌──────────────────────────┐
-     │    Orchestrator: Merge   │
-     │    + Conflict Resolution │
-     └──────────────┬───────────┘
-                    ▼
-             Final Report
+     ┌─────┴──────┐
+     ▼            ▼
+┌────────┐  ┌──────────┐
+│Discovery│  │Org Policy│  ← run in parallel
+│ Agent   │  │  Agent   │
+└────┬───┘  └─────┬────┘
+     └──────┬─────┘
+            ▼
+     ┌──────────────┐
+     │ Architecture │
+     │    Agent     │
+     └──────┬───────┘
+            │
+            ▼
+     ┌──────────────┐
+     │  Estimation  │
+     │    Agent     │
+     └──────┬───────┘
+            │
+            ▼
+  ┌──────────────────────────┐
+  │    Orchestrator: Merge   │
+  │    + Conflict Resolution │
+  └──────────────┬───────────┘
+                 ▼
+          Final Report
 ```
 
 ---
@@ -95,7 +107,7 @@ The Orchestrator is the entry point for all interactions. It parses the user's i
 **Responsibilities:**
 
 - Parse natural language requests and extract task parameters
-- Determine which sub-agents to invoke (not all three are always needed)
+- Determine which sub-agents to invoke (not all four are always needed)
 - Manage execution order and handle sub-agent failures gracefully
 - Detect and resolve conflicting outputs (e.g. Discovery flags high complexity; Estimation disagrees)
 - Generate the consolidated migration assessment report
@@ -106,10 +118,11 @@ The Orchestrator is the entry point for all interactions. It parses the user's i
 User: "Assess this VB6 application for migration to AWS and provide an effort estimate."
 
 Orchestrator plan:
-  1. Call Discovery Agent   → extract app characteristics
-  2. Call Architecture Agent → recommend target state on AWS
-  3. Call Estimation Agent  → size the effort
-  4. Merge outputs and generate report
+  1. Call Discovery Agent    → extract app characteristics        ┐ parallel
+  2. Call Org Policies Agent → fetch org migration standards      ┘
+  3. Call Architecture Agent → recommend target state on AWS (uses 1 + 2)
+  4. Call Estimation Agent   → size the effort (uses 1 + 3)
+  5. Merge outputs and generate report
 ```
 
 ---
@@ -130,10 +143,27 @@ Extracts structured facts about the application or portfolio from unstructured s
 
 ---
 
+### Org Policies Agent
+
+**Role:** Policy & Standards Advisor  
+**Input:** Target cloud platform + organisation identifier (resolved from session context)
+
+Fetches and normalises the organisation's internal best practices and mandatory policies for cloud migration, ensuring the Architecture Agent's recommendations are compliant before they are generated rather than reviewed after the fact.
+
+**Outputs:**
+- Approved cloud services and patterns (e.g. container-first, approved database tiers)
+- Prohibited services or configurations (e.g. public S3 buckets, unapproved regions)
+- Mandatory controls: encryption at rest/in transit, tagging standards, network topology (hub-spoke, private endpoints)
+- Compliance frameworks that apply to the workload (SOC 2, ISO 27001, GDPR, FedRAMP)
+- Landing zone and account/subscription structure standards
+- Escalation flags for workloads that require a security or compliance review before migration
+
+---
+
 ### Architecture Agent
 
 **Role:** Cloud Solutions Architect  
-**Input:** Discovery Agent output + target cloud platform (if specified)
+**Input:** Discovery Agent output + Org Policies Agent output + target cloud platform (if specified)
 
 Produces a recommended target-state architecture based on the application profile.
 
@@ -203,15 +233,24 @@ Produces a structured effort estimate and migration roadmap.
 │  Document  │   │  Orchestrator    │
 │  Parser    │──►│  Agent (LLM)     │
 │ (PDF/DOCX/ │   │                  │
-│  XLSX)     │   └──┬────┬──────┬───┘
-└────────────┘      │    │      │
-                    ▼    ▼      ▼
-             ┌──────┐ ┌──────┐ ┌──────────┐
-             │Disco- │ │Arch. │ │Estimation│
-             │very   │ │Agent │ │Agent     │
-             │Agent  │ │      │ │          │
-             └──┬───┘ └──┬───┘ └────┬─────┘
-                └─────────┴──────────┘
+│  XLSX)     │   └──┬──────────┬────┘
+└────────────┘      │          │
+               ┌────┴───┐  ┌───┴──────┐
+               │Disco-  │  │Org Policy│  (parallel)
+               │very    │  │  Agent   │
+               │Agent   │  │          │
+               └───┬────┘  └────┬─────┘
+                   └──────┬─────┘
+                          ▼
+                     ┌──────────┐
+                     │  Arch.   │
+                     │  Agent   │
+                     └────┬─────┘
+                          ▼
+                     ┌──────────┐
+                     │Estimation│
+                     │  Agent   │
+                     └────┬─────┘
                           │
                           ▼
                 ┌──────────────────┐
@@ -304,15 +343,21 @@ Recommend a target architecture and give me a rough effort estimate.
 
 ```
 [Orchestrator]   Intent: single-app deep assessment, target=AWS, VB6 context
-[Orchestrator]   Plan: Discovery → Architecture → Estimation → Report
+[Orchestrator]   Plan: Discovery ∥ OrgPolicies → Architecture → Estimation → Report
 
-[Discovery]      App: "PolicyAdmin v2.1" | Stack: VB6 + SQL Server 2008 | 
-                 12 integrations | No containerization signals | 
-                 Complexity: HIGH
+[Discovery]      App: "PolicyAdmin v2.1" | Stack: VB6 + SQL Server 2008 |    ┐
+                 12 integrations | No containerization signals |               │ parallel
+                 Complexity: HIGH                                              │
+                                                                               │
+[OrgPolicies]    Standard: Container-first for all new workloads               │
+                 Required: Encryption at rest (AES-256), TLS 1.2+             │
+                 Network: Hub-Spoke topology, no public endpoints              ┘
+                 Compliance: SOC 2 Type II | Flag: regulated data → sec review
 
 [Architecture]   Strategy: Refactor (VB6 → .NET 8 on ECS Fargate)
-                 DB: SQL Server → Amazon RDS SQL Server
+                 DB: SQL Server → Amazon RDS SQL Server (Multi-AZ, encrypted)
                  Integration: MQ Series → Amazon MQ
+                 Landing zone: Spoke VPC via Transit Gateway (per org standard)
                  Risk: Data migration complexity, batch job re-engineering
 
 [Estimation]     Effort: 18–24 weeks | Team: 6 FTEs

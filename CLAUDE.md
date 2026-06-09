@@ -52,16 +52,18 @@ MAX_UPLOAD_SIZE_MB=25
 The system uses a multi-agent orchestration pattern. The **Orchestrator Agent** is the sole entry point — it parses intent, builds an execution plan, invokes sub-agents in sequence, resolves conflicts between outputs, and assembles the final report. Sub-agents are not called directly by the user.
 
 ```
-User → Orchestrator → [Discovery, Architecture, Estimation] → Merge → Report
+User → Orchestrator → [Discovery ∥ OrgPolicies] → Architecture → Estimation → Merge → Report
 ```
 
 **Discovery Agent** — extracts structured facts from uploaded documents: app name/owner, tech stack, dependency map, tech debt indicators, cloud readiness signals.
 
-**Architecture Agent** — takes Discovery output and recommends target-state architecture: migration strategy (Rehost/Replatform/Refactor/Replace/Retire), cloud service mapping, landing zone pattern, security considerations.
+**Org Policies Agent** — runs in parallel with Discovery. Fetches the organisation's migration standards and mandatory controls: approved services, prohibited configurations, encryption/networking requirements, applicable compliance frameworks (SOC 2, ISO 27001, GDPR, etc.), and landing zone standards. Its output is passed directly to the Architecture Agent so recommendations are policy-compliant before being generated, not reviewed after.
+
+**Architecture Agent** — takes Discovery output **and** Org Policies output and recommends target-state architecture: migration strategy (Rehost/Replatform/Refactor/Replace/Retire), cloud service mapping, landing zone pattern, security controls aligned to org standards.
 
 **Estimation Agent** — takes Discovery + Architecture output and produces effort estimates: story points or day-based sizing by workstream (infra/app/data/testing), wave groupings, risk-adjusted timelines.
 
-The Orchestrator handles partial execution — not all three sub-agents are invoked for every request. When sub-agent outputs conflict (e.g., Discovery says HIGH complexity but Estimation disagrees), the Orchestrator must detect and resolve before generating the report.
+The Orchestrator handles partial execution — not all four sub-agents are invoked for every request. When sub-agent outputs conflict (e.g., Discovery says HIGH complexity but Estimation disagrees), the Orchestrator must detect and resolve before generating the report.
 
 ## Input / Output Contract
 
