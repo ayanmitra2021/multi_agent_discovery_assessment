@@ -79,3 +79,14 @@ All agent decisions must be logged with rationale for audit trail purposes.
 - **`ENABLE_MULTI_AGENT=false`** collapses the pipeline to single-agent mode — the orchestration layer must gracefully handle this without changing the public API surface.
 - **Portfolio limit**: `MAX_APPS_PER_RUN=50` — document parsers and agent loops must respect this cap.
 - **Report output**: Written to `REPORT_OUTPUT_DIR`; the web UI offers download after generation.
+- **MCP hook chain**: `MCPClient.call_tool()` runs a **pre/post hook chain** around every MCP tool invocation — all 10 hooks defined in `app/mcp/hooks.py`. Pre-hooks (in order): pre-call audit logging, input normalization, CSP validation, argument bounds enforcement, per-session call budget. Post-hooks (in order): error normalization, empty-result enrichment, result size limiting, metadata enrichment, post-call audit logging. This is the single enforcement point for all MCP tool safety — no per-tool or per-agent defensive coding should be added elsewhere. When introducing new MCP tools, the hook chain applies automatically with zero extra work.
+
+## MCP Hook Chain
+
+The hook chain lives entirely in `app/mcp/hooks.py` and is wired into `MCPClient.__init__()`. Key invariants to preserve:
+
+- `CSPGuardHook` must execute **after** `InputNormalizationHook` — normalization lowercases `"AWS"` to `"aws"` before the guard validates it.
+- `ErrorNormalizationHook` must be the **first post-hook** — it wraps all subsequent post-hooks' input in a safe state if the underlying tool call threw an exception.
+- `SizeLimiterHook` must preserve valid JSON after truncation — it trims the record list, not raw character bytes.
+- `CallBudgetHook` keyed on `(tool_name, frozenset(args.items()))` — different args to the same tool are always allowed through; only exact duplicates are short-circuited.
+- `call_tool(name, args, ctx)` now requires `AssessmentContext` — do not call it without one. The audit hooks write directly to `ctx.audit_events`.

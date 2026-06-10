@@ -1,6 +1,6 @@
 # Plan: Multi-Agent Cloud Migration Assessment — Backend
 
-**Created**: 2026-06-09 | **Effort**: ~26h | **Complexity**: Complex
+**Created**: 2026-06-09 | **Effort**: ~30h | **Complexity**: Complex
 
 ---
 
@@ -14,6 +14,7 @@
 - `POST /api/assess` accepts a file + CSP and returns a full `AssessmentReport` JSON
 - Discovery and Org Policies agents run in parallel via `asyncio.gather()`; Architecture waits for both
 - Org Policies Agent retrieves data exclusively via MCP tools backed by a seeded SQLite policy store
+- Every MCP tool call passes through the 10-hook chain in `mcp/hooks.py` before reaching the DB
 - Every agent decision is persisted to an audit trail keyed by `assessment_id`
 - Switching `LLM_PROVIDER` (claude/openai/gemini) requires only an env-var change
 
@@ -42,6 +43,7 @@ server/
 │   ├── agents/                  # base, discovery, policies, architecture, estimation
 │   ├── mcp/
 │   │   ├── client.py            # MCPClient wrapper (used by Policies Agent)
+│   │   ├── hooks.py             # Pre/post hook chain for all MCP tool calls
 │   │   └── server/              # server.py, tools.py, repository.py
 │   ├── audit/                   # trail.py, events.py
 │   └── persistence/             # policies_db.py, audit_db.py, seed/
@@ -67,6 +69,12 @@ CloudMigrationOrchestrator.run(AssessmentContext seed)
 DiscoveryAgent.run()                  OrgPoliciesAgent.run()    ← asyncio.gather()
 (AppProfile via                       (PolicyContext via
  claude-opus-4-8 + tool use)           claude-opus-4-8 + MCP tools)
+                                               │
+                                       MCPClient.call_tool()
+                                               │
+                                       [Pre-hook chain × 5]
+                                       [MCP server / SQLite]
+                                       [Post-hook chain × 5]
     │                                          │
     └──────────────────┬───────────────────────┘
                        ▼
@@ -94,6 +102,7 @@ DiscoveryAgent.run()                  OrgPoliciesAgent.run()    ← asyncio.gath
 | Agentic loop | SDK tool runner (`client.beta.messages.toolRunner()`) or manual loop | Tool runner for simple agents; manual loop for Policies Agent (need to intercept MCP calls) |
 | LLM abstraction | `LLMClient` Protocol + factory | Agents depend on protocol; switching provider = env-var change |
 | MCP transport | In-process STDIO for MVP | Zero extra process management; MCP tools exposed as Anthropic tool format via `anthropic.lib.tools.mcp` |
+| MCP hook chain | 5 pre-hooks + 5 post-hooks in `MCPClient.call_tool()` | Single enforcement point for input safety, result safety, and audit completeness across all MCP tool invocations |
 | Policy store | SQLite + SQLAlchemy | Zero-setup for dev; swap to Postgres by changing one env var |
 | State container | `AssessmentContext` Python dataclass | Plain Python; no framework-managed state graph; explicitly passed between agents |
 | Report format | JSON + Markdown (MVP); DOCX optional | Fastest to ship; frontend can render immediately |
@@ -208,18 +217,45 @@ class OrgPoliciesAgent(BaseAgent):
             )
             if response.stop_reason == "end_turn":
                 break
-            # Execute MCP tool calls
+            # Execute MCP tool calls — hooks fire inside call_tool()
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
-                    result = await self.mcp_client.call_tool(block.name, block.input)
+                    result = await self.mcp_client.call_tool(block.name, block.input, ctx)
                     tool_results.append({"type": "tool_result",
                                          "tool_use_id": block.id, "content": result})
-                    self._emit_audit(ctx, f"mcp_tool_{block.name}")
             messages.append({"role": "assistant", "content": response.content})
             messages.append({"role": "user", "content": tool_results})
         return self._parse_policy_context(response, ctx)
 ```
+
+### MCP Tool Hook Chain
+
+All MCP tool calls pass through a hook chain inside `MCPClient.call_tool(name, args, ctx)`:
+
+```
+call_tool(name, args, ctx)
+    │
+    ├─ [PRE-1] PreAuditHook          → emit tool_call_start to ctx.audit_events
+    ├─ [PRE-2] InputNormalizationHook → lowercase csp, strip whitespace, normalize lists
+    ├─ [PRE-3] CSPGuardHook          → reject invalid csp with {"_error": ..., "recoverable": true}
+    ├─ [PRE-4] ArgBoundsHook         → cap limit ≤ 10, list args ≤ 5 items
+    ├─ [PRE-5] CallBudgetHook        → short-circuit duplicate (tool, args) with cached result
+    │
+    ├─ _session.call_tool(name, args)   ← actual MCP/SQLite call
+    │
+    ├─ [POST-1] ErrorNormalizationHook → catch exceptions → {"_error": ..., "recoverable": bool}
+    ├─ [POST-2] EmptyResultHook       → enrich [] with {"_warning": "try broader filters", "data": []}
+    ├─ [POST-3] SizeLimiterHook       → truncate if > 6000 chars; append "_truncated": true
+    ├─ [POST-4] MetaEnrichHook        → append _latency_ms, _result_count, _called_at
+    └─ [POST-5] PostAuditHook         → emit tool_call_complete with outcome + latency to ctx.audit_events
+```
+
+**Ordering invariants**:
+- `CSPGuardHook` must execute after `InputNormalizationHook` (so `"AWS"` is lowercased before validation).
+- `ErrorNormalizationHook` must be the first post-hook (normalizes exceptions before subsequent hooks run).
+- `SizeLimiterHook` truncates the record list, not raw bytes, to preserve valid JSON.
+- `CallBudgetHook` is keyed on `(tool_name, frozenset(args.items()))` — different args to the same tool are always allowed through.
 
 ### Policies DB schema (SQLite)
 
@@ -299,48 +335,61 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "pytest-cov>=5.0", "httpx"]
 10. **SQLAlchemy ORM models + engine setup** (0.5h) — `persistence/policies_db.py`; all 5 tables | Deps: Task 3 | Risk: L
 11. **Seed data** (1h) — realistic policies for AWS, Azure, GCP; ≥3 compliance frameworks; ≥5 past migration patterns per CSP | Deps: Task 10 | Risk: M (data quality determines Policies Agent output quality)
 12. **MCP server** (1.5h) — `mcp/server/server.py` using the `mcp` Python library; register 4 tool handlers; `repository.py` with SQLAlchemy queries; expose via STDIO transport | Deps: Tasks 10-11 | Risk: H (mcp library STDIO lifecycle needs careful management)
-13. **MCP client wrapper** (1h) — `mcp/client.py`; `MCPClient.list_tools_as_anthropic_format()` (converts MCP tool schemas to Anthropic `Tool` format); `call_tool(name, args)`; retry-with-backoff; in-process STDIO client using `mcp` library | Deps: Task 12 | Risk: M
+13. **MCP client wrapper** (1h) — `mcp/client.py`; `MCPClient.list_tools_as_anthropic_format()` (converts MCP tool schemas to Anthropic `Tool` format); `call_tool(name, args, ctx)`; retry-with-backoff; in-process STDIO client using `mcp` library | Deps: Task 12 | Risk: M
 
 ### Phase 4 — Agent Implementations (~5.5h)
 
 14. **BaseAgent + AssessmentContext** (0.5h) — `context.py` dataclass; `agents/base.py` with `_emit_audit()` helper; `run()` protocol | Deps: Tasks 3, 4 | Risk: L
 15. **Discovery Agent** (1h) — builds document prompt; calls `client.messages.parse()` with `output_config.format` JSON schema; returns `AppProfile`; handles partial extraction via Pydantic `model_validate` | Deps: Tasks 3, 4, 14 | Risk: H (LLM structured output reliability)
-16. **Org Policies Agent** (1.5h) — manual tool-use agentic loop; calls 4 MCP tools; assembles `PolicyContext` from accumulated tool results; degrades gracefully on partial MCP failure | Deps: Tasks 3, 13, 14 | Risk: M
+16. **Org Policies Agent** (1.5h) — manual tool-use agentic loop; calls 4 MCP tools passing `ctx` to `call_tool()`; assembles `PolicyContext` from accumulated tool results; degrades gracefully on partial MCP failure | Deps: Tasks 3, 13, 14 | Risk: M
 17. **Architecture Agent** (1.5h) — injects `AppProfile` + `PolicyContext` summary into prompt; validates recommended services are in approved list; returns `ArchitecturePlan` via structured output | Deps: Tasks 3, 4, 14 | Risk: H (prompt engineering; policy constraint injection)
 18. **Estimation Agent** (1h) — uses `AppProfile` + `ArchitecturePlan`; parametric effort model in prompt; returns `EstimationReport` via structured output | Deps: Tasks 3, 4, 14 | Risk: M
 
-### Phase 5 — Orchestrator + Async Pipeline (~3h)
+### Phase 5 — MCP Tool Hook Chain (~3.5h)
 
-19. **CloudMigrationOrchestrator** (1h) — `orchestrator.py`; `async def run(doc, csp)` method; `asyncio.gather(discovery.run(ctx), policies.run(ctx), return_exceptions=True)` for parallel phase; sequential calls for Architecture → Estimation; `compose_report()` | Deps: Tasks 14-18 | Risk: M (exception handling across `gather()` must not drop audit events)
-20. **Conflict detection + resolution** (0.5h) — post-gather check: if Architecture strategy contradicts Discovery complexity tier, emit warning audit event + lower confidence | Deps: Task 19 | Risk: M
-21. **Audit trail persistence** (0.5h) — `audit/trail.py`; writes `AuditEvent` list from `AssessmentContext` to `audit.sqlite` after pipeline completes | Deps: Tasks 14, 19 | Risk: L
-22. **`AssessmentContext` status management** (0.5h) — set `status="partial"` when any agent errored but pipeline continued; `status="failed"` when critical agents failed; surface in `AssessResponse` | Deps: Task 19 | Risk: L
-23. **DI wiring in `deps.py`** (0.5h) — `get_orchestrator()` FastAPI dependency; starts MCP server subprocess on lifespan startup; constructs client and orchestrator | Deps: Tasks 12-13, 19 | Risk: L
+19. **Hook base types** (0.5h) — `mcp/hooks.py`; define `PreToolHook` and `PostToolHook` protocols; `HookContext` dataclass carrying `tool_name`, `args`, `result`, `latency_ms`, `assessment_id`; `HookChain` holding ordered pre/post lists with `execute_pre()` / `execute_post()` methods that pass context between hooks | Deps: Tasks 13, 14 | Risk: L
 
-### Phase 6 — Report Builder + API Integration (~2h)
+20. **Pre-call hooks** (1h) — implement 5 pre-hooks in `mcp/hooks.py`: `PreAuditHook` (emit `tool_call_start` to `ctx.audit_events`), `InputNormalizationHook` (lowercase `csp`, strip whitespace, normalize list items), `CSPGuardHook` (reject invalid CSP values with `{"_error": "...", "recoverable": true}` JSON — must run after normalization), `ArgBoundsHook` (cap `limit` ≤ 10, list args ≤ 5 items), `CallBudgetHook` (track calls per `(tool_name, frozenset(args.items()))` per session; short-circuit identical repeats with cached result) | Deps: Task 19 | Risk: M (CallBudgetHook must not block intentional repeat calls with different args)
 
-24. **Report composer** (0.5h) — `compose_report(ctx)` assembles `AssessmentReport` from all context outputs + audit summary | Deps: Tasks 14-21 | Risk: L
-25. **JSON + Markdown serialisation** (0.5h) — `AssessmentReport → dict`; Markdown template via Jinja2 | Deps: Task 24 | Risk: L
-26. **Complete `POST /api/assess` endpoint** (1h) — wire: upload → parse → orchestrator.run() → report → `AssessResponse`; error responses; CORS headers matching Next.js client origin | Deps: Tasks 9, 19, 24-25 | Risk: L
+21. **Post-call hooks** (1h) — implement 5 post-hooks in `mcp/hooks.py`: `ErrorNormalizationHook` (first post-hook — catches any exception from the tool call and returns `{"_error": "...", "tool": "...", "recoverable": bool}` JSON), `EmptyResultHook` (detect `[]` / `{}` results; return `{"_warning": "no results — try broader filters", "data": []}` so the LLM retries), `SizeLimiterHook` (truncate result record list when serialized JSON > 6000 chars; append `"_truncated": true, "_total_records": N` — truncate the list, not raw bytes, to preserve valid JSON), `MetaEnrichHook` (append `_latency_ms`, `_result_count`, `_called_at` to every response), `PostAuditHook` (emit `tool_call_complete` with outcome, latency, and record count to `ctx.audit_events`) | Deps: Task 19 | Risk: M (SizeLimiterHook must preserve valid JSON after truncation)
 
-### Phase 7 — Tests (~3h)
+22. **MCPClient hook chain integration** (0.5h) — update `MCPClient.call_tool(name, args, ctx)` to accept `AssessmentContext`; construct default `HookChain` with all 10 hooks in correct order in `MCPClient.__init__()`; run `chain.execute_pre(ctx, name, args)` before `_session.call_tool()`; record start time; run `chain.execute_post(ctx, name, args, result, latency_ms)` after; confirm `OrgPoliciesAgent` passes `ctx` to `call_tool()` | Deps: Tasks 19-21 | Risk: L
 
-27. **Parser unit tests** (0.5h) — fixture files for each format; assert `ParsedDocument` fields | Deps: Tasks 5-8 | Risk: L
-28. **MCP tool unit tests** (0.5h) — seed in-memory SQLite; call each MCP tool handler directly (bypassing STDIO); assert returns | Deps: Tasks 10-12 | Risk: L
-29. **Agent unit tests (mocked LLM + MCP)** (1h) — mock `client.messages.parse()` / `messages.create()` to return fixture responses; assert each agent returns correct schema shape | Deps: Tasks 14-18 | Risk: M
-30. **Orchestrator integration test** (0.5h) — full pipeline with mocked LLM + in-process MCP; assert `AssessmentContext` has all outputs set and `len(audit_events) >= 8` | Deps: Tasks 19-26 | Risk: M
-31. **API integration test** (0.5h) — `httpx.AsyncClient` against FastAPI test app; upload fixture PDF; assert `200` + `assessment_id` in response | Deps: Task 26 | Risk: L
+23. **Hook unit tests** (0.5h) — `tests/unit/test_mcp_hooks.py`; test each of the 10 hooks in isolation with fixture args; assert `CSPGuardHook` returns structured error JSON for `"amazon"`; assert `ArgBoundsHook` caps `limit` to 10 and truncates overlong list args; assert `CallBudgetHook` short-circuits on identical repeated calls and passes through different-arg calls; assert `SizeLimiterHook` truncates at threshold and output remains valid JSON; assert hook chain executes in documented order via instrumented stub | Deps: Tasks 19-22 | Risk: L
 
-**Total**: ~26h
+### Phase 6 — Orchestrator + Async Pipeline (~3h)
+
+24. **CloudMigrationOrchestrator** (1h) — `orchestrator.py`; `async def run(doc, csp)` method; `asyncio.gather(discovery.run(ctx), policies.run(ctx), return_exceptions=True)` for parallel phase; sequential calls for Architecture → Estimation; `compose_report()` | Deps: Tasks 14-18, 22 | Risk: M (exception handling across `gather()` must not drop audit events)
+25. **Conflict detection + resolution** (0.5h) — post-gather check: if Architecture strategy contradicts Discovery complexity tier, emit warning audit event + lower confidence | Deps: Task 24 | Risk: M
+26. **Audit trail persistence** (0.5h) — `audit/trail.py`; writes `AuditEvent` list from `AssessmentContext` to `audit.sqlite` after pipeline completes | Deps: Tasks 14, 24 | Risk: L
+27. **`AssessmentContext` status management** (0.5h) — set `status="partial"` when any agent errored but pipeline continued; `status="failed"` when critical agents failed; surface in `AssessResponse` | Deps: Task 24 | Risk: L
+28. **DI wiring in `deps.py`** (0.5h) — `get_orchestrator()` FastAPI dependency; starts MCP server subprocess on lifespan startup; constructs client and orchestrator | Deps: Tasks 12-13, 24 | Risk: L
+
+### Phase 7 — Report Builder + API Integration (~2h)
+
+29. **Report composer** (0.5h) — `compose_report(ctx)` assembles `AssessmentReport` from all context outputs + audit summary | Deps: Tasks 14-26 | Risk: L
+30. **JSON + Markdown serialisation** (0.5h) — `AssessmentReport → dict`; Markdown template via Jinja2 | Deps: Task 29 | Risk: L
+31. **Complete `POST /api/assess` endpoint** (1h) — wire: upload → parse → orchestrator.run() → report → `AssessResponse`; error responses; CORS headers matching Next.js client origin | Deps: Tasks 9, 24, 29-30 | Risk: L
+
+### Phase 8 — Tests (~3h)
+
+32. **Parser unit tests** (0.5h) — fixture files for each format; assert `ParsedDocument` fields | Deps: Tasks 5-8 | Risk: L
+33. **MCP tool unit tests** (0.5h) — seed in-memory SQLite; call each MCP tool handler directly (bypassing STDIO); assert returns | Deps: Tasks 10-12 | Risk: L
+34. **Agent unit tests (mocked LLM + MCP)** (1h) — mock `client.messages.parse()` / `messages.create()` to return fixture responses; assert each agent returns correct schema shape | Deps: Tasks 14-18 | Risk: M
+35. **Orchestrator integration test** (0.5h) — full pipeline with mocked LLM + in-process MCP; assert `AssessmentContext` has all outputs set and `len(audit_events) >= 16` (8 agent events + ≥8 hook audit events across 4 tool calls) | Deps: Tasks 24-31 | Risk: M
+36. **API integration test** (0.5h) — `httpx.AsyncClient` against FastAPI test app; upload fixture PDF; assert `200` + `assessment_id` in response | Deps: Task 31 | Risk: L
+
+**Total**: ~30h
 
 ---
 
 ## 4. Quality Strategy
 
-- **Tests**: `pytest` + `pytest-asyncio`; unit tests for parsers, MCP tools, agents (mocked); integration tests for orchestrator and API. Target ≥80% coverage on `agents/`, `mcp/`, `orchestrator.py`.
+- **Tests**: `pytest` + `pytest-asyncio`; unit tests for parsers, MCP tools, hooks, agents (mocked); integration tests for orchestrator and API. Target ≥80% coverage on `agents/`, `mcp/`, `orchestrator.py`; ≥90% branch coverage on `mcp/hooks.py`.
 - **Structured output reliability**: `client.messages.parse()` with `output_config.format` provides Pydantic-validated JSON. Fallback: if `parsed_output` is None (refusal or schema mismatch), return a partial schema with `confidence=0` and emit an audit warning.
 - **Partial failure resilience**: `asyncio.gather(return_exceptions=True)` catches agent failures without aborting the pipeline. Architecture Agent receives degraded inputs (None policy context) and still runs with a warning.
-- **Audit completeness**: every `messages.create()` call, every MCP tool call, every agent entry/exit emits an `AuditEvent` — verified by the orchestrator integration test asserting `len(audit_events) >= 8` per run.
+- **Audit completeness**: every `messages.create()` call, every MCP tool call (via hook audit events), every agent entry/exit emits an `AuditEvent` — verified by the orchestrator integration test asserting `len(audit_events) >= 16` per run.
+- **Hook chain correctness**: each of the 10 hooks is unit-tested in isolation (Task 23); hook chain ordering is verified by an instrumented stub test that asserts execution sequence matches the documented order.
 - **Model choice**: all agents default to `claude-opus-4-8`; `thinking: {type: "adaptive"}` enabled on Discovery and Architecture (complex reasoning tasks); disabled on Estimation (parametric model, structured extraction).
 
 ---
@@ -351,6 +400,9 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "pytest-cov>=5.0", "httpx"]
 |---|---|---|
 | LLM structured output unreliable (hallucinated fields, wrong types) | H | `client.messages.parse()` with `output_config.format` + Pydantic validation; fallback to partial extraction; test with fixture documents |
 | MCP `mcp` library STDIO lifecycle management | H | Implement MCP repository as direct function calls first (integration test without STDIO); add STDIO transport wrapper after agents pass unit tests |
+| Hook chain ordering bug silently mangles tool inputs | M | `CSPGuardHook` must fire after `InputNormalizationHook`; verified by chain-ordering test in Task 23; `ErrorNormalizationHook` must be first post-hook — enforce via constructor order, not convention |
+| `CallBudgetHook` blocks intentional repeat calls with broader args | M | Key budget on `(tool_name, frozenset(args.items()))` — different args always pass through; unit test with same tool, different args to confirm |
+| `SizeLimiterHook` produces invalid JSON after truncation | M | Truncate the record list at the Python level, re-serialize; never slice raw strings; assert output parses as valid JSON in Task 23 |
 | Seed data quality determines Architecture Agent output quality | M | Write ≥15 realistic policies per CSP; include approved service lists; review seed before wiring Architecture Agent |
 | `asyncio.gather()` exception silently swallowed | M | Always use `return_exceptions=True`; assert result types before assigning to context; log exceptions before degraded-mode continuation |
 | pdfplumber returns empty text for scanned/image PDFs | M | Detect empty extraction; return warning in `ParsedDocument.warnings`; surface to user in API response |

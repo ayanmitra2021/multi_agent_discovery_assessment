@@ -12,6 +12,7 @@
   - [Orchestrator Agent](#orchestrator-agent)
   - [Discovery Agent](#discovery-agent)
   - [Org Policies Agent](#org-policies-agent)
+  - [MCP Tool Hook Chain](#mcp-tool-hook-chain)
   - [Architecture Agent](#architecture-agent)
   - [Estimation Agent](#estimation-agent)
 - [Input Formats](#input-formats)
@@ -157,6 +158,35 @@ Fetches and normalises the organisation's internal best practices and mandatory 
 - Compliance frameworks that apply to the workload (SOC 2, ISO 27001, GDPR, FedRAMP)
 - Landing zone and account/subscription structure standards
 - Escalation flags for workloads that require a security or compliance review before migration
+
+---
+
+### MCP Tool Hook Chain
+
+**Role:** Infrastructure reliability layer for all MCP tool invocations  
+**Location:** `app/mcp/hooks.py`, wired into `MCPClient.call_tool()`
+
+Every MCP tool call made by the Org Policies Agent passes through a **hook chain** — an ordered set of pre- and post-call interceptors at the `MCPClient` level. The hooks are transparent to agents: `OrgPoliciesAgent` calls `mcp_client.call_tool()` as normal, and all ten hooks fire automatically.
+
+**Pre-call hooks** (run before the request reaches the database):
+
+| Hook | Purpose |
+|---|---|
+| Pre-call audit logging | Records `tool_call_start` event in the `AssessmentContext` audit trail |
+| Input normalization | Lowercases `csp`, strips whitespace, normalizes list items to consistent casing |
+| CSP guard | Rejects invalid cloud provider values with a structured JSON error the LLM can self-correct |
+| Argument bounds | Caps `limit` at 10 and list parameters at 5 items to prevent context-window flooding |
+| Per-tool call budget | Short-circuits duplicate calls (same tool + same args) with a cached result; detects runaway loops |
+
+**Post-call hooks** (run after the database returns):
+
+| Hook | Purpose |
+|---|---|
+| Error normalization | Converts database exceptions to structured JSON the LLM can reason about rather than crashing the tool-use loop |
+| Empty result detection | Enriches `[]` responses with a corrective hint (e.g., "try broader `capability_tags` or omit the filter") |
+| Result size limiter | Truncates payloads exceeding 6,000 characters and appends `"_truncated": true` to protect the context window |
+| Result metadata enrichment | Appends `_latency_ms`, `_result_count`, and `_called_at` to every response for observability |
+| Post-call audit logging | Records `tool_call_complete` with outcome, latency, and record count in the audit trail |
 
 ---
 
