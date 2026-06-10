@@ -153,8 +153,7 @@ class OrgPoliciesAgent(BaseAgent):
             tool_results: list[dict] = []
             for block in response.content:
                 if isinstance(block, ToolUseBlock):
-                    self._log(ctx, "tool_call", tool=block.name, args=block.input)
-                    result_text = await self._mcp.call_tool(block.name, block.input)
+                    result_text = await self._mcp.call_tool(block.name, block.input, ctx)
                     tool_calls_made.append(block.name)
                     tool_results.append(
                         {
